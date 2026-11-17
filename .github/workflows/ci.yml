@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  COVERAGE_MIN: 75
+
 jobs:
   api:
     name: api
@@ -45,6 +48,29 @@ jobs:
 
       - name: Unit tests with coverage
         run: npm run test:coverage
+
+      - name: Check coverage threshold
+        run: |
+          LINES=$(jq -r '.total.lines.pct' coverage/coverage-summary.json)
+          STATEMENTS=$(jq -r '.total.statements.pct' coverage/coverage-summary.json)
+          FUNCTIONS=$(jq -r '.total.functions.pct' coverage/coverage-summary.json)
+          BRANCHES=$(jq -r '.total.branches.pct' coverage/coverage-summary.json)
+
+          {
+            echo "### API coverage (Node ${{ matrix.node }})"
+            echo ""
+            echo "| Metric | Coverage |"
+            echo "|---|---:|"
+            echo "| Lines | ${LINES}% |"
+            echo "| Statements | ${STATEMENTS}% |"
+            echo "| Functions | ${FUNCTIONS}% |"
+            echo "| Branches | ${BRANCHES}% |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if awk -v pct="$LINES" -v min="$COVERAGE_MIN" 'BEGIN { exit !(pct < min) }'; then
+            echo "::error title=Coverage below threshold::Lines ${LINES}% < ${COVERAGE_MIN}%"
+            exit 1
+          fi
 
   api-integration:
     name: api-integration
