@@ -101,9 +101,10 @@ resource "docker_container" "api" {
 }
 
 resource "docker_container" "front" {
-  name    = "${local.prefix}-front"
-  image   = docker_image.front.image_id
-  restart = "unless-stopped"
+  name         = "${local.prefix}-front"
+  image        = docker_image.front.image_id
+  restart      = "unless-stopped"
+  wait_timeout = 90
 
   ports {
     internal = 80
