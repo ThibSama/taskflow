@@ -195,60 +195,100 @@ jobs:
       contents: read
       packages: read
 
+    defaults:
+      run:
+        working-directory: infra
+
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
       FRONT_PORT: ${{ vars.FRONT_PORT || '8081' }}
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/../.tofu-plugin-cache
+      TF_VAR_front_port: ${{ vars.FRONT_PORT || '8081' }}
+      TF_VAR_ghcr_username: ${{ github.actor }}
+      TF_VAR_ghcr_token: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Check runner
+        working-directory: .
         run: |
           if [ -z "${STAGING_DIR:-}" ] || [ ! -d "$STAGING_DIR" ]; then
             echo "::error::STAGING_DIR is missing or invalid"
             exit 1
           fi
 
-          if [ ! -f "$STAGING_DIR/.env" ]; then
-            echo "::error::$STAGING_DIR/.env is missing"
-            exit 1
-          fi
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          tofu version
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Copy deployment files
+      - name: Initialize OpenTofu
         run: |
-          cp compose.staging.yaml "$STAGING_DIR/"
-          cp deploy/deploy.sh "$STAGING_DIR/"
-          cp deploy/smoke-test.sh "$STAGING_DIR/"
-          chmod +x "$STAGING_DIR/deploy.sh" "$STAGING_DIR/smoke-test.sh"
+          tofu init \
+            -lockfile=readonly \
+            -backend-config="path=$STAGING_DIR/terraform.tfstate"
 
-      - name: Log in to GHCR
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          printf '%s' "$GHCR_TOKEN" \
-            | docker login ghcr.io \
-                -u "$GITHUB_ACTOR" \
-                --password-stdin
+      - name: Configure OpenTofu variables
+        run: ./ci-env.sh "$TAG"
 
-      - name: Deploy staging
+      - name: Migrate from Compose if needed
         run: |
-          cd "$STAGING_DIR"
-          COMPOSE_FILE=compose.staging.yaml ./deploy.sh "$TAG"
+          ids="$(docker ps -aq --filter label=com.docker.compose.project=taskflow-staging)"
+
+          if [ -n "$ids" ]; then
+            echo "Compose staging detected: removing containers and network"
+            # shellcheck disable=SC2086
+            docker rm -f $ids
+            docker network rm taskflow-staging
+          fi
+
+          if ! tofu state list 2>/dev/null | grep -qx 'docker_volume.pgdata' \
+             && docker volume inspect taskflow-staging-pgdata >/dev/null 2>&1; then
+            echo "Existing volume detected: importing into OpenTofu state"
+            tofu import \
+              -lock-timeout=120s \
+              docker_volume.pgdata \
+              taskflow-staging-pgdata
+          fi
+
+      - name: Plan staging
+        run: |
+          tofu plan \
+            -no-color \
+            -lock-timeout=120s \
+            -out=tfplan
+
+      - name: Apply staging
+        run: |
+          tofu apply \
+            -no-color \
+            -lock-timeout=120s \
+            tfplan
+
+          rm -f tfplan
 
       - name: Smoke test
+        working-directory: .
         run: |
-          cd "$STAGING_DIR"
-          ./smoke-test.sh \
+          ./deploy/smoke-test.sh \
             "http://host.docker.internal:${FRONT_PORT}/health" \
             "$TAG"
 
-      - name: Log out from GHCR
+      - name: Add staging summary
         if: always()
-        run: docker logout ghcr.io || true
+        run: |
+          {
+            echo "### Staging (OpenTofu)"
+            echo "| Version | URL |"
+            echo "|---|---|"
+            echo "| \`$TAG\` | $(tofu output -raw url 2>/dev/null || echo '?') |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
+          rm -f tfplan
   deploy-production:
     name: Deploy production
     needs: [prepare, images, deploy-staging]
